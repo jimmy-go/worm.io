@@ -27,13 +27,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	// SQLite driver
-	// _ "github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/robfig/cron"
@@ -41,14 +42,17 @@ import (
 )
 
 // Connect starts a default worm hub.
-func Connect(connectURL string) error {
+func Connect(connectURL, logDir string) error {
 	var err error
-	defaultWorm, err = New(connectURL)
+	defaultWorm, err = New(connectURL, logDir)
 	return err
 }
 
 // New connects to sqlite database and returns a new Worm hub.
-func New(connectURL string) (*Worm, error) {
+func New(connectURL, logDir string) (*Worm, error) {
+	if len(logDir) < 1 {
+		return nil, errors.New("log directory not set")
+	}
 	db, err := sqlx.Connect("sqlite3", connectURL)
 	if err != nil {
 		return nil, err
@@ -59,6 +63,7 @@ func New(connectURL string) (*Worm, error) {
 		doers:  make(map[string]Doer),
 		Db:     db,
 		croner: c,
+		logDir: logDir,
 	}
 	c.Start()
 	return x, nil
@@ -80,44 +85,45 @@ type Worm struct {
 	doers  map[string]Doer
 	croner *cron.Cron
 	Db     *sqlx.DB
+	logDir string
 	sync.RWMutex
 }
 
 // Register register the worker for this worm. Must be called at init time.
-func (w *Worm) Register(workerName string, doer Doer) error {
+func (h *Worm) Register(workerName string, doer Doer) error {
 	if doer == nil {
 		return errors.New("nil worker")
 	}
-	_, ok := w.doers[workerName]
+	_, ok := h.doers[workerName]
 	if ok {
 		return errors.New("worm: worker already registered")
 	}
-	w.doers[workerName] = doer
+	h.doers[workerName] = doer
 	return nil
 }
 
 // MustRegister register the worker interface for this worm.
-func (w *Worm) MustRegister(workerName string, doer Doer) {
-	err := w.Register(workerName, doer)
+func (h *Worm) MustRegister(workerName string, doer Doer) {
+	err := h.Register(workerName, doer)
 	if err != nil {
 		panic(err)
 	}
 }
 
 // store stores the work data on database.
-func (w *Worm) store(workerName string, data []byte) (Doer, string, error) {
-	w.RLock()
-	doer, ok := w.doers[workerName]
-	w.RUnlock()
+func (h *Worm) store(workerName string, data []byte) (Doer, string, error) {
+	h.RLock()
+	doer, ok := h.doers[workerName]
+	h.RUnlock()
 	if !ok {
 		return doer, "", errors.New("worm: doer not found")
 	}
 
 	jobID := uuid.NewV4().String()
 
-	_, err := w.Db.Exec(`
-		INSERT INTO worm (id,worker_name,status,data,created_at)
-		VALUES (?,?,?,?,?);
+	_, err := h.Db.Exec(`
+	INSERT INTO worm (id,worker_name,status,data,created_at)
+	VALUES (?,?,?,?,?);
 	`, jobID, workerName, StatusStart, data, time.Now().UTC())
 	if err != nil {
 		return doer, "", err
@@ -126,31 +132,40 @@ func (w *Worm) store(workerName string, data []byte) (Doer, string, error) {
 }
 
 // Queue will cron the job for execution on cronformat.
-func (w *Worm) Queue(workerName string, data []byte) (string, error) {
-	return w.Sched(workerName, data, nowCron(time.Now()))
+func (h *Worm) Queue(workerName string, data []byte) (string, error) {
+	return h.Sched(workerName, data, nowCron(time.Now()))
 }
 
 // Sched will cron the job for execution on cronformat.
-func (w *Worm) Sched(workerName string, data []byte, cronformat string) (string, error) {
-	doer, jobID, err := w.store(workerName, data)
+func (h *Worm) Sched(workerName string, data []byte, cronformat string) (string, error) {
+	doer, jobID, err := h.store(workerName, data)
 	if err != nil {
 		return "", err
 	}
 
-	err = w.croner.AddFunc(cronformat, func() {
-		logOut, status, jobErr := doer.Run(data)
+	err = h.croner.AddFunc(cronformat, func() {
+
+		// prepare log file.
+
+		lName, lOut, err := newLog(h.logDir, doer.Name(), jobID)
+		if err != nil {
+			log.Printf("run job : err [%s]", err)
+			return
+		}
+		defer func() {
+			if err := lOut.Close(); err != nil {
+				log.Printf("run : close log output file : err [%s]", err)
+			}
+		}()
+
+		var errMsg string
+		status, jobErr := doer.Run(data, lOut)
 		if jobErr != nil {
-			log.Printf("run job : err [%s]", jobErr)
+			errMsg = fmt.Sprintf("%s", jobErr)
 		}
-		log.Printf("Sched : job done [%v]", status)
-
-		if err := writeLog(logOut, workerName, jobID); err != nil {
-			log.Printf("write log output : err [%s]", err)
-		}
-
-		_, err = w.Db.Exec(`
-			UPDATE worm SET status=?,error=? WHERE id=?;
-		`, status, jobErr, jobID)
+		_, err = h.Db.Exec(`
+			UPDATE worm SET status=?,error=?,log_file=? WHERE id=?;
+		`, status, errMsg, lName, jobID)
 		if err != nil {
 			log.Printf("Sched : update status : err [%s] job id [%s]", err, jobID)
 		}
@@ -161,45 +176,66 @@ func (w *Worm) Sched(workerName string, data []byte, cronformat string) (string,
 	return jobID, nil
 }
 
-func writeLog(src io.Reader, workerName, jobID string) error {
-	// TODO; create file in custom dir.
-	fname := fmt.Sprintf("%v_%v.log", workerName, jobID)
-	log.Printf("writeLog : name [%s]", fname)
-	f, err := ioutil.TempFile("", fname)
+// newLog generates a log output for job. Must be closed.
+func newLog(dir string, workerName, jobID string) (string, *os.File, error) {
+	fname := filepath.Clean(fmt.Sprintf("%s/%s_%s.log", dir, workerName, jobID))
+	f, err := os.Create(fname)
 	if err != nil {
-		return err
+		return fname, nil, err
 	}
-	log.Printf("writeLog : temp name [%s]", f.Name())
-	defer func() {
-		if err := f.Close(); err != nil {
-			log.Printf("writeLog : close file : err [%s]", err)
-		}
-	}()
-
-	_, err = io.Copy(f, src)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return fname, f, nil
 }
 
-// Status return the job status by id.
-func (w *Worm) Status(ID string) (int, error) {
-	var status int
-	err := w.Db.Get(&status, `
-		SELECT status FROM worm WHERE id=?;
+// Detail return the job detail by id.
+func (h *Worm) Detail(ID string) (*Job, error) {
+	var d Job
+	err := h.Db.Get(&d, `
+		SELECT
+			id,
+			worker_name,
+			status,
+			IFNULL(error,'') AS "error",
+			data,
+			log_file,
+			created_at
+		FROM worm WHERE id=?;
 	`, ID)
 	if err != nil {
 		log.Printf("job err [%s]", err)
-		return -1, err
+		return nil, err
 	}
-	return status, nil
+	return &d, nil
+}
+
+// CopyLog return the job detail by id.
+func (h *Worm) CopyLog(w io.Writer, jobID string) error {
+	var name string
+	err := h.Db.Get(&name, `
+		SELECT log_file FROM worm WHERE id=?;
+	`, jobID)
+	if err != nil {
+		log.Printf("CopyLog : locate : err [%s]", err)
+		return err
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Printf("CopyLog : close file : err [%s]", err)
+		}
+	}()
+	_, err = io.Copy(w, f)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // Close close database connections.
-func (w *Worm) Close() error {
-	return w.Db.Close()
+func (h *Worm) Close() error {
+	return h.Db.Close()
 }
 
 // Register _
@@ -222,14 +258,58 @@ func Sched(workerName string, data []byte, cronformat string) (string, error) {
 	return defaultWorm.Sched(workerName, data, cronformat)
 }
 
-// Status _
-func Status(ID string) (int, error) {
-	return defaultWorm.Status(ID)
+// Detail _
+func Detail(ID string) (*Job, error) {
+	return defaultWorm.Detail(ID)
+}
+
+// Job struct for database query.
+type Job struct {
+	ID        string    `db:"id" json:"id"`
+	Worker    string    `db:"worker_name" json:"worker_name"`
+	Status    int       `db:"status" json:"status"`
+	Error     string    `db:"error" json:"error"`
+	LogFile   string    `db:"log_file" json:"log_file"`
+	Data      string    `db:"data" json:"data"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+}
+
+// Query _
+func Query(before, after time.Time, limit int) ([]*Job, error) {
+	db := DB()
+	var jobs []*Job
+	err := db.Select(&jobs, `
+	SELECT
+		id,
+		worker_name,
+		status,
+		IFNULL(error,'') AS "error",
+		log_file,
+		data,
+		created_at
+	FROM worm
+	WHERE created_at BETWEEN ? AND ? LIMIT ?;
+	`, before.Format(time.RFC3339)[:10], after.Format(time.RFC3339)[:10], limit)
+	if err != nil {
+		log.Printf("Query : retrieve : err [%s]", err)
+	}
+	return jobs, err
+}
+
+// DB returns the default worm Db. Use it only for queries more complicated than
+// Query method.
+func DB() *sqlx.DB {
+	return defaultWorm.Db
 }
 
 // Close close database connections.
 func Close() error {
 	return defaultWorm.Close()
+}
+
+// CopyLog write the content of log file to w.
+func CopyLog(w io.Writer, jobID string) error {
+	return defaultWorm.CopyLog(w, jobID)
 }
 
 // Doer interface. Your implementation must make sure that
@@ -239,13 +319,24 @@ type Doer interface {
 	// Name returns worker name.
 	Name() string
 
-	// Run executes the job.
+	// Run executes the job and Worm writes the logOut to a file and state to
+	// database.
 	// If success state returned must be zero.
-	Run(data []byte) (logOut io.Reader, state int, err error)
+	Run(data []byte, logOutput io.Writer) (state int, err error)
 }
 
 // nowCron return cron string with t date. Once execution.
 func nowCron(t time.Time) string {
 	t = t.Add(1 * time.Second)
 	return fmt.Sprintf("%v %v %v %v %v *", t.Second(), t.Minute(), t.Hour(), t.Day(), int(t.Month()))
+}
+
+// Printf convenience.
+func Printf(w io.Writer, format string, args ...interface{}) {
+	fmt.Fprintf(w, format+"\n", args...)
+}
+
+// Println convenience.
+func Println(w io.Writer, args ...interface{}) {
+	fmt.Fprintln(w, args...)
 }
