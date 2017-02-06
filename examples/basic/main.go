@@ -2,154 +2,152 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-
-	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
+	"time"
 
 	"github.com/jimmy-go/srest"
+	_ "github.com/mattn/go-sqlite3"
+
 	worm "github.com/jimmy-go/worm.io"
 )
 
 var (
-	port = flag.Int("port", 8080, "Listen port.")
-	whub *worm.Worm
-)
-
-const (
-	workerName = "sample_worker"
+	port       = flag.Int("port", 8080, "Listen port.")
+	connectURL = flag.String("db", "", "SQLite connection URL.")
 )
 
 func main() {
 	flag.Parse()
-	var err error
-	whub, err = worm.New()
-	if err != nil {
-		log.Fatal(err)
-	}
+	log.SetFlags(log.Lshortfile)
 
-	// make temporal db for business logic example.
-
-	db, err := prepareDB("sqlite3", ":memory:")
+	err := worm.Connect(*connectURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// register worker keeping just one connection.
 
-	myWorker := &Xample{
-		Db: db,
-	}
-	whub.MustRegister(workerName, myWorker)
+	worm.MustRegister(SampleName, &Xample{})
 
 	// start http server
 	m := srest.New(nil)
 	m.Post("/add", http.HandlerFunc(jobHandler))
 	m.Post("/sched", http.HandlerFunc(schedHandler))
-	m.Get("/job/:id", http.HandlerFunc(statusHandler))
+	m.Get("/job", http.HandlerFunc(statusHandler))
 	<-m.Run(*port)
-}
-
-func prepareDB(driver, uri string) (*sqlx.DB, error) {
-	db, err := sqlx.Connect(driver, uri)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = db.Exec(`CREATE TABLE example (id integer not null primary key, name text, data text)`)
-	if err != nil {
-		return nil, err
-	}
-	return db, nil
-}
-
-// Todo struct.
-type Todo struct {
-	ID   string
-	Data []byte
+	worm.Close()
 }
 
 func jobHandler(w http.ResponseWriter, r *http.Request) {
-	_ = r.ParseForm()
-	jname := r.Form.Get("name")
-	id := r.Form.Get("id")
-	data := r.Form.Get("json")
-
-	toDo := &Todo{
-		ID:   id,
-		Data: []byte(data),
+	if err := r.ParseForm(); err != nil {
+		log.Printf("jobHandler : err [%s]", err)
 	}
 
-	err := whub.Queue(jname, toDo)
+	// TODO; validate model.
+
+	v := &JOB{
+		URL: r.Form.Get("url"),
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, "can't marshal task", http.StatusInternalServerError)
+		return
+	}
+
+	jobID, err := worm.Queue(SampleName, b)
 	if err != nil {
 		http.Error(w, "can't add task", http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprint(w, "OK")
+	fmt.Fprintf(w, "job id: %s", jobID)
 }
 
 func schedHandler(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		log.Printf("jobHandler : err [%s]", err)
+	}
 
+	// TODO; validate model.
+	crons := r.Form.Get("cron")
+
+	v := &JOB{
+		URL: r.Form.Get("url"),
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, "can't marshal task", http.StatusInternalServerError)
+		return
+	}
+
+	jobID, err := worm.Sched(SampleName, b, crons)
+	if err != nil {
+		http.Error(w, "can't add task", http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "job id: %s", jobID)
+}
+
+// JOB struct.
+type JOB struct {
+	URL string `json:"url"`
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	log.Printf("status : id [%s]", id)
 
+	i, err := worm.Status(id)
+	if err != nil {
+		http.Error(w, "can't retrieve job status", http.StatusInternalServerError)
+		return
+	}
+	if err := srest.JSON(w, &ResStatus{ID: id, Status: i}); err != nil {
+		log.Printf("statusHandler : render : err [%s]", err)
+	}
 }
 
-// Item mock.
-type Item struct {
-	ID   int    `db:"id"`
-	Name string `db:"name"`
-	Data string `db:"data"`
+// ResStatus struct.
+type ResStatus struct {
+	ID     string `json:"id"`
+	Status int    `json:"status"`
 }
 
 // Xample type for sample Doer interface.
-type Xample struct {
-	Db *sqlx.DB
+type Xample struct{}
+
+const (
+	// SampleName the Xample default name.
+	SampleName = "sample_worker"
+)
+
+// Name implements worm.Doer.
+func (x *Xample) Name() string {
+	return SampleName
 }
 
 // Run implements worm.Doer.
-func (x *Xample) Run(status int, v interface{}) (int, error) {
-	td, ok := v.(*Todo)
-	if !ok {
-		return status, errors.New("can't store job")
+func (x *Xample) Run(data []byte) (io.Reader, int, error) {
+	l := bytes.NewBuffer([]byte{})
+
+	var v *JOB
+	if err := json.Unmarshal(data, &v); err != nil {
+		fmt.Fprintf(l, "Run : unmarshal : err [%s]", err)
+		return l, 1, errors.New("some error happend with the time second")
 	}
 
-	// inner logic allow take a job from a certain point.
-	switch status {
-	case 0:
-		_, err := x.Db.Exec(`
-			INSERT INTO example (name,data) VALUES (?,?);
-		`, td.ID, td.Data)
-		if err != nil {
-			return status, err
-		}
-		status++
-	case 1:
-		b := []byte("data changed")
-		_, err := x.Db.Exec(`
-			UPDATE example SET data=? WHERE name=?;
-		`, b, td.ID)
-		if err != nil {
-			return status, err
-		}
-		status++
-	case 2: // this status means failure
-		b := []byte("fail")
-		_, err := x.Db.Exec(`
-			UPDATE example SET data=? WHERE name=?;
-		`, b, td.ID)
-		if err != nil {
-			return status, err
-		}
-		status++
-	default:
-		return status, errors.New("status not found")
+	fmt.Fprintf(l, "Run : doing something")
+
+	if time.Now().Second()%2 == 0 {
+		fmt.Fprintf(l, "Run : some random error")
+		return l, 2, errors.New("some error happend with the time second")
 	}
-	status++
-	return status, nil
+
+	return l, worm.StatusOK, nil
 }
