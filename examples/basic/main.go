@@ -50,7 +50,7 @@ func main() {
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		log.Printf("jobHandler : err [%s]", err)
+		log.Printf("listHandler : err [%s]", err)
 	}
 
 	before := time.Now().UTC()
@@ -92,7 +92,7 @@ func jobHandler(w http.ResponseWriter, r *http.Request) {
 
 func schedHandler(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		log.Printf("jobHandler : err [%s]", err)
+		log.Printf("schedHandler : err [%s]", err)
 	}
 
 	// TODO; validate model.
