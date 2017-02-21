@@ -64,7 +64,9 @@ func New(connectURL, logDir string) (*Worm, error) {
 		Db:     db,
 		croner: c,
 		logDir: logDir,
+		waitc:  make(chan struct{}, 1),
 	}
+	x.waitc <- struct{}{}
 	c.Start()
 	return x, nil
 }
@@ -85,6 +87,11 @@ type Worm struct {
 	doers  map[string]Doer
 	croner *cron.Cron
 	Db     *sqlx.DB
+
+	// waitc channel make all the database operations without concurrency.
+	// future implementations would have connection pooling.
+	// see: https://godoc.org/github.com/mxk/go-sqlite/sqlite3#hdr-Concurrency
+	waitc  chan struct{}
 	logDir string
 	sync.RWMutex
 }
@@ -121,10 +128,12 @@ func (h *Worm) store(workerName string, data []byte) (Doer, string, error) {
 
 	jobID := uuid.NewV4().String()
 
+	o := <-h.waitc
 	_, err := h.Db.Exec(`
 	INSERT INTO worm (id,worker_name,status,data,created_at)
 	VALUES (?,?,?,?,?);
 	`, jobID, workerName, StatusStart, data, time.Now().UTC())
+	h.waitc <- o
 	if err != nil {
 		return doer, "", err
 	}
@@ -161,11 +170,16 @@ func (h *Worm) Sched(workerName string, data []byte, cronformat string) (string,
 		var errMsg string
 		status, jobErr := doer.Run(data, lOut)
 		if jobErr != nil {
+			log.Printf("task fail: %s", jobErr)
+
 			errMsg = fmt.Sprintf("%s", jobErr)
+			Printf(lOut, "ERROR: %s", jobErr)
 		}
+		o := <-h.waitc
 		_, err = h.Db.Exec(`
 			UPDATE worm SET status=?,error=?,log_file=? WHERE id=?;
 		`, status, errMsg, lName, jobID)
+		h.waitc <- o
 		if err != nil {
 			log.Printf("Sched : update status : err [%s] job id [%s]", err, jobID)
 		}
@@ -189,6 +203,7 @@ func newLog(dir string, workerName, jobID string) (string, *os.File, error) {
 // Detail return the job detail by id.
 func (h *Worm) Detail(ID string) (*Job, error) {
 	var d Job
+	o := <-h.waitc
 	err := h.Db.Get(&d, `
 		SELECT
 			id,
@@ -200,6 +215,7 @@ func (h *Worm) Detail(ID string) (*Job, error) {
 			created_at
 		FROM worm WHERE id=?;
 	`, ID)
+	h.waitc <- o
 	if err != nil {
 		log.Printf("job err [%s]", err)
 		return nil, err
@@ -210,9 +226,12 @@ func (h *Worm) Detail(ID string) (*Job, error) {
 // CopyLog return the job detail by id.
 func (h *Worm) CopyLog(w io.Writer, jobID string) error {
 	var name string
+
+	o := <-h.waitc
 	err := h.Db.Get(&name, `
 		SELECT log_file FROM worm WHERE id=?;
 	`, jobID)
+	h.waitc <- o
 	if err != nil {
 		log.Printf("CopyLog : locate : err [%s]", err)
 		return err
@@ -278,6 +297,7 @@ type Job struct {
 func Query(before, after time.Time, limit int) ([]*Job, error) {
 	db := DB()
 	var jobs []*Job
+	o := <-defaultWorm.waitc
 	err := db.Select(&jobs, `
 	SELECT
 		id,
@@ -290,6 +310,7 @@ func Query(before, after time.Time, limit int) ([]*Job, error) {
 	FROM worm
 	WHERE created_at BETWEEN ? AND ? LIMIT ?;
 	`, before.Format(time.RFC3339)[:10], after.Format(time.RFC3339)[:10], limit)
+	defaultWorm.waitc <- o
 	if err != nil {
 		log.Printf("Query : retrieve : err [%s]", err)
 	}
