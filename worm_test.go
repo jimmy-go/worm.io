@@ -2,6 +2,5 @@ package worm
 
 import "testing"
 
-func TestN(t *testing.T) {
-	t.Fail()
+func TestNew(t *testing.T) {
 }

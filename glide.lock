@@ -1,0 +1,14 @@
+hash: 96e252db6c006db578a5844ce2735fbe604082b2b6feb386962eebdd98079514
+updated: 2018-02-16T21:43:26.891321-06:00
+imports:
+- name: github.com/jmoiron/sqlx
+  version: 05cef0741ade10ca668982355b3f3f0bcf0ff0a8
+  subpackages:
+  - reflectx
+- name: github.com/mattn/go-sqlite3
+  version: 6c771bb9887719704b210e87e934f08be014bdb1
+- name: github.com/robfig/cron
+  version: b024fc5ea0e34bc3f83d9941c8d60b0622bfaca4
+- name: github.com/satori/go.uuid
+  version: f58768cc1a7a7e77a3bd49e98cdd21419399b6a3
+testImports: []
